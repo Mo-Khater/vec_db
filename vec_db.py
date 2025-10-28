@@ -1,6 +1,8 @@
 from typing import Dict, List, Annotated
 import numpy as np
 import os
+import faiss
+import math
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -57,27 +59,52 @@ class VecDB:
         vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
         return np.array(vectors)
     
-    def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k = 5):
-        scores = []
-        num_records = self._get_num_records()
-        # here we assume that the row number is the ID of each vector
-        for row_num in range(num_records):
-            vector = self.get_one_row(row_num)
-            score = self._cal_score(query, vector)
-            scores.append((score, row_num))
-        # here we assume that if two rows have the same score, return the lowest ID
-        scores = sorted(scores, reverse=True)[:top_k]
-        return [s[1] for s in scores]
-    
+    def retrieve(self, query, top_k=5):
+        index = faiss.read_index(self.index_path)
+        query = query.astype(np.float32)
+        faiss.normalize_L2(query)
+        _, indices = index.search(query, top_k)
+        return indices[0].tolist()
+        
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
         norm_vec1 = np.linalg.norm(vec1)
         norm_vec2 = np.linalg.norm(vec2)
         cosine_similarity = dot_product / (norm_vec1 * norm_vec2)
         return cosine_similarity
-
+    def _determine_n_clusters(self, n_vectors):
+            # Resources:
+            # https://github.com/facebookresearch/faiss/wiki/Faiss-indexes
+            # https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index
+            # https://github.com/facebookresearch/faiss/wiki/The-index-factory#ivf-indexes
+            # https://www-users.cse.umn.edu/~kumar001/papers/high_dim_clustering_19.pdf
+            # Heuristic: n_clusters = 2 ^ ceil(log2(sqrt(n_vectors))) bounded between 256 and 4096
+            if n_vectors < 256:
+                n_clusters = max(1, n_vectors // 4)
+                n_clusters = 2 ** math.ceil(math.log2(n_clusters))
+                return max(1, n_clusters)
+            else:
+                base = math.sqrt(n_vectors)
+                n_clusters = int(base)  
+                n_clusters = max(256, min(n_clusters, 4096))
+                n_clusters = 2 ** math.ceil(math.log2(n_clusters))
+                return min(n_clusters, n_vectors)
+            
     def _build_index(self):
-        # Placeholder for index building logic
-        pass
+        quantizer = faiss.IndexFlatL2(DIMENSION)
+        num_records = self._get_num_records()
+        # nlist = max(1, int(np.sqrt(num_records)))  # instead of num_records/100
+        nlist = self._determine_n_clusters(num_records)
+        index = faiss.IndexIVFFlat(quantizer, DIMENSION, nlist, faiss.METRIC_L2)
+
+        vectors = self.get_all_rows().astype(np.float32)
+        faiss.normalize_L2(vectors)  # normalize for cosine-like search
+
+        index.train(vectors)
+        index.add(vectors)
+        # index.nprobe = 64  # increase probe count
+        n_probes = max(4, min(32, nlist // 16))
+        index.nprobe = n_probes
+        faiss.write_index(index, self.index_path)
 
 
